@@ -1,4 +1,4 @@
-# BlueStacks Macro Recorder
+# ADB Macro Recorder
 
 A Python/tkinter GUI tool that records mouse and keyboard input on your PC and replays it inside any Android emulator accessible via ADB with sub-millisecond timing accuracy.
 
@@ -38,7 +38,7 @@ ADB must be able to connect to `127.0.0.1:5555` before playing back.
 python macro_recorder.py
 ```
 
-1. Click **Record** and perform actions in BlueStacks while the window is focused.
+1. Click **Record** and perform actions in your emulator while the window is focused.
 2. Press **Stop** (or the hotkey shown in the UI) to finish recording.
 3. Give the profile a name and save it.
 4. Select the profile and click **Play**.
