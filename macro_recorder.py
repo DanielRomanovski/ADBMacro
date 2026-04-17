@@ -928,6 +928,182 @@ class ActionEditDialog(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Drag-waypoint editor dialog
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DragEditDialog(tk.Toplevel):
+    """Modal editor for a multi-point drag gesture.
+
+    Displays all waypoints in a table (X, Y, Time, Offset) and lets the
+    user edit or delete individual points.
+    Returns the (possibly modified) list of action dicts via .result, or
+    None if the dialog was cancelled.
+    """
+
+    def __init__(self, parent: tk.Misc, actions: list[dict]) -> None:
+        super().__init__(parent)
+        self.title("Edit Drag Waypoints")
+        self.geometry("560x440")
+        self.minsize(420, 300)
+        self.grab_set()
+        self.transient(parent)
+        self.result: list[dict] | None = None
+        self._acts = copy.deepcopy(actions)
+        self._build()
+        self.wait_window()
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        # ── header summary ────────────────────────────────────────────────
+        hdr = ttk.Frame(self, padding=(10, 8, 10, 4))
+        hdr.grid(row=0, column=0, sticky="ew")
+        self._hdr_lbl = ttk.Label(hdr, font=("Segoe UI", 10))
+        self._hdr_lbl.pack(side="left")
+        self._refresh_header()
+
+        # ── waypoint table ────────────────────────────────────────────────
+        tv_frm = ttk.Frame(self, padding=(8, 0, 8, 0))
+        tv_frm.grid(row=1, column=0, sticky="nsew")
+        tv_frm.columnconfigure(0, weight=1)
+        tv_frm.rowconfigure(0, weight=1)
+
+        cols = ("#", "X", "Y", "Time (s)", "Offset (s)")
+        self._tv = ttk.Treeview(
+            tv_frm, columns=cols, show="headings", selectmode="browse")
+        for c in cols:
+            self._tv.heading(c, text=c)
+        self._tv.column("#",          width=44,  stretch=False, anchor="center")
+        self._tv.column("X",          width=72,  stretch=False, anchor="e")
+        self._tv.column("Y",          width=72,  stretch=False, anchor="e")
+        self._tv.column("Time (s)",   width=95,  stretch=False, anchor="e")
+        self._tv.column("Offset (s)", width=95,  stretch=False, anchor="e")
+        vsb = ttk.Scrollbar(tv_frm, orient="vertical", command=self._tv.yview)
+        self._tv.configure(yscrollcommand=vsb.set)
+        self._tv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self._tv.bind("<Double-Button-1>", self._edit_row)
+        self._populate()
+
+        # ── row toolbar ───────────────────────────────────────────────────
+        btns = ttk.Frame(self, padding=(8, 4))
+        btns.grid(row=2, column=0, sticky="ew")
+        ttk.Button(btns, text="Edit point",
+                   command=self._edit_row).pack(side="left", padx=2)
+        ttk.Button(btns, text="Delete point",
+                   command=self._delete_row).pack(side="left", padx=2)
+        ttk.Label(
+            btns,
+            text="Double-click a row to edit its X / Y coordinates",
+            foreground="gray", font=("Segoe UI", 8),
+        ).pack(side="left", padx=10)
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=3, column=0, sticky="ew")
+        bot = ttk.Frame(self, padding=(8, 6))
+        bot.grid(row=4, column=0, sticky="ew")
+        ttk.Button(
+            bot, text="Save changes", command=self._save).pack(side="right", padx=4)
+        ttk.Button(
+            bot, text="Cancel", command=self.destroy).pack(side="right")
+
+    def _refresh_header(self) -> None:
+        if not self._acts:
+            return
+        t0  = self._acts[0].get("time", 0.0)
+        tN  = self._acts[-1].get("time", 0.0)
+        self._hdr_lbl.config(
+            text=(f"{len(self._acts)} waypoints    "
+                  f"start: ({self._acts[0].get('x')}, {self._acts[0].get('y')})    "
+                  f"end: ({self._acts[-1].get('x')}, {self._acts[-1].get('y')})    "
+                  f"duration: {tN - t0:.3f} s"))
+
+    def _populate(self) -> None:
+        for it in self._tv.get_children():
+            self._tv.delete(it)
+        t0 = self._acts[0].get("time", 0.0) if self._acts else 0.0
+        for i, act in enumerate(self._acts):
+            t = act.get("time", 0.0)
+            self._tv.insert(
+                "", "end", iid=str(i),
+                values=(i + 1, act.get("x", ""), act.get("y", ""),
+                        f"{t:.4f}", f"+{t - t0:.4f}"))
+
+    def _edit_row(self, _event=None) -> None:
+        sel = self._tv.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        act = self._acts[idx]
+
+        sub = tk.Toplevel(self)
+        sub.title(f"Waypoint #{idx + 1}")
+        sub.resizable(False, False)
+        sub.grab_set()
+        sub.transient(self)
+
+        frm = ttk.Frame(sub, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        var_x = tk.StringVar(value=str(act.get("x", 0)))
+        var_y = tk.StringVar(value=str(act.get("y", 0)))
+        var_t = tk.StringVar(value=str(act.get("time", 0.0)))
+
+        for row, (lbl, var) in enumerate(
+                [("X (screen px):", var_x),
+                 ("Y (screen px):", var_y),
+                 ("Time (s):",      var_t)]):
+            ttk.Label(frm, text=lbl).grid(
+                row=row, column=0, sticky="w", padx=4, pady=3)
+            ttk.Entry(frm, textvariable=var, width=14).grid(
+                row=row, column=1, sticky="ew", padx=4, pady=3)
+
+        def _apply() -> None:
+            try:
+                act["x"]    = int(float(var_x.get()))
+                act["y"]    = int(float(var_y.get()))
+                act["time"] = float(var_t.get())
+            except ValueError:
+                return
+            sub.destroy()
+            self._populate()
+            self._refresh_header()
+            if str(idx) in self._tv.get_children():
+                self._tv.selection_set(str(idx))
+
+        btn_f = ttk.Frame(frm)
+        btn_f.grid(row=3, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(btn_f, text="Apply",  command=_apply).pack(side="right", padx=4)
+        ttk.Button(btn_f, text="Cancel", command=sub.destroy).pack(side="right")
+        sub.wait_window()
+
+    def _delete_row(self) -> None:
+        sel = self._tv.selection()
+        if not sel:
+            return
+        if len(self._acts) <= 2:
+            messagebox.showwarning(
+                "Cannot delete",
+                "A drag needs at least 2 waypoints.",
+                parent=self)
+            return
+        idx = int(sel[0])
+        del self._acts[idx]
+        self._populate()
+        self._refresh_header()
+        # select the next available row
+        new_sel = min(idx, len(self._acts) - 1)
+        children = self._tv.get_children()
+        if children:
+            self._tv.selection_set(children[new_sel])
+
+    def _save(self) -> None:
+        self.result = self._acts
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main application
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -956,7 +1132,7 @@ class App(tk.Tk):
 
         # continue-recording state
         self._append_mode_var   = tk.BooleanVar(value=False)
-        self._append_pos_var    = tk.StringVar(value="end")
+        self._append_pos_var    = tk.StringVar(value="At end")
 
         self._player       = Player(on_action=self._playback_action_cb,
                                     on_done=self._playback_done_cb)
@@ -1444,20 +1620,29 @@ class App(tk.Tk):
         indices = self._row_map.get(iid, [])
         if not indices:
             return
-        # If the row is a condensed drag group, edit the first raw action
-        idx     = indices[0]
         actions = self._cur_profile["actions"]
+        # ── Drag group: open the waypoint table editor ─────────────────────
+        if len(indices) > 1:
+            group_acts = [actions[i] for i in indices if i < len(actions)]
+            dlg = DragEditDialog(self, group_acts)
+            if dlg.result is not None:
+                # Write modified waypoints back into the original positions
+                for offset, act in enumerate(dlg.result):
+                    if offset < len(indices) and indices[offset] < len(actions):
+                        actions[indices[offset]] = act
+                self._pm.save(self._cur_profile)
+                self._reload_actions()
+                if iid in self._tree.get_children():
+                    self._tree.selection_set(iid)
+                    self._tree.see(iid)
+            return
+        # ── Single action: open the field editor ───────────────────────────
+        idx = indices[0]
         if idx >= len(actions):
             return
-        if len(indices) > 1:
-            if not messagebox.askyesno(
-                    "Edit drag group",
-                    f"This row represents {len(indices)} move events.\n"
-                    "Edit the first one? (switch to Raw view to edit all individually)"):
-                return
-        dlg = ActionEditDialog(self, actions[idx])
-        if dlg.result is not None:
-            actions[idx] = dlg.result
+        dlg2 = ActionEditDialog(self, actions[idx])
+        if dlg2.result is not None:
+            actions[idx] = dlg2.result
             self._pm.save(self._cur_profile)
             self._reload_actions()
             if iid in self._tree.get_children():
@@ -1587,8 +1772,9 @@ class App(tk.Tk):
         iid     = row
         indices = self._row_map.get(iid, [])
         is_drag = len(indices) > 1
-        m.add_command(label="Edit" + (" (first in group)" if is_drag else ""),
-                      command=self._edit_action)
+        m.add_command(
+            label="Edit waypoints..." if is_drag else "Edit",
+            command=self._edit_action)
         m.add_command(label="Duplicate",       command=self._duplicate_action)
         m.add_command(label="Delete",          command=self._delete_actions)
         m.add_separator()
@@ -1596,12 +1782,6 @@ class App(tk.Tk):
         m.add_command(label="Move Down",       command=self._move_down)
         m.add_separator()
         m.add_command(label="Add Delay After", command=self._add_delay)
-        if is_drag:
-            m.add_separator()
-            m.add_command(
-                label="Expand (switch to Raw view to edit individual points)",
-                command=lambda: [
-                    self._condensed_var.set(False), self._reload_actions()])
         m.tk_popup(event.x_root, event.y_root)
 
     # ── Recording ─────────────────────────────────────────────────────────────
