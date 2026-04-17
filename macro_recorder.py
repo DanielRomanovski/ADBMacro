@@ -1143,13 +1143,21 @@ class DragCardList(tk.Frame):
             self.on_select(self.selection())
 
     def clear_playing(self) -> None:
+        prev = self._playing_idx
         self._playing_idx = None
-        self._refresh_colors()
+        # Only recolor the card that lost the highlight
+        if prev is not None and 0 <= prev < len(self._cards):
+            self._set_card_bg(prev)
 
     def set_playing(self, index: int) -> None:
+        prev = self._playing_idx
         self._playing_idx = index
-        self._refresh_colors()
-        self._scroll_to(index)
+        # Recolor only the two cards that changed
+        if prev is not None and prev != index and 0 <= prev < len(self._cards):
+            self._set_card_bg(prev)
+        if 0 <= index < len(self._cards):
+            self._set_card_bg(index)
+            self._scroll_to(index)
 
     # ── card factory ─────────────────────────────────────────────────────────
 
@@ -1387,15 +1395,21 @@ class DragCardList(tk.Frame):
 
     def _refresh_colors(self) -> None:
         for i, card in enumerate(self._cards):
-            if i == self._playing_idx:
-                bg = self._PLAY_BG
-            elif i in self._selected:
-                bg = self._SEL_BG
-            elif i == self._drag_target and self._drag_ghost:
-                bg = "#e0f0ff"
-            else:
-                bg = self._CARD_BG
-            self._set_bg_recursive(card, bg)
+            self._set_card_bg(i)
+
+    def _set_card_bg(self, i: int) -> None:
+        """Recolor a single card based on its current state."""
+        if i >= len(self._cards):
+            return
+        if i == self._playing_idx:
+            bg = self._PLAY_BG
+        elif i in self._selected:
+            bg = self._SEL_BG
+        elif i == self._drag_target and self._drag_ghost:
+            bg = "#e0f0ff"
+        else:
+            bg = self._CARD_BG
+        self._set_bg_recursive(self._cards[i], bg)
 
     def _set_bg_recursive(self, widget, bg: str) -> None:
         try:
@@ -1459,6 +1473,7 @@ class App(tk.Tk):
         # Continue-recording state
         self._cont_mode:        str  = "append"    # "prepend"|"append"|"after_sel"
         self._cont_insert_idx:  int  = -1          # used in "after_sel" mode
+        self._last_ui_update:   float = 0.0            # throttle playback UI
 
         self._player       = Player(on_action=self._playback_action_cb,
                                     on_done=self._playback_done_cb)
@@ -2220,7 +2235,13 @@ class App(tk.Tk):
         self._stop_f9_listener()
 
     def _playback_action_cb(self, cmd_idx: int, loop_num: int, total: int) -> None:
-        """Called from player thread — schedule on main thread."""
+        """Called from player thread — schedule on main thread.
+        Throttled to ~20 fps so the tkinter event queue never floods.
+        """
+        now = time.perf_counter()
+        if now - self._last_ui_update < 0.05:   # 50 ms = 20 fps cap
+            return
+        self._last_ui_update = now
         self.after(0, self._update_play_ui, cmd_idx, loop_num, total)
 
     def _update_play_ui(self, cmd_idx: int, loop_num: int, total: int) -> None:
