@@ -1,6 +1,6 @@
 # BlueStacks Macro Recorder
 
-A Python/tkinter GUI tool that records mouse and keyboard input on your PC and replays it inside **BlueStacks 5** (or any Android emulator accessible via ADB) with sub-millisecond timing accuracy.
+A Python/tkinter GUI tool that records mouse and keyboard input on your PC and replays it inside any Android emulator accessible via ADB with sub-millisecond timing accuracy.
 
 ---
 
