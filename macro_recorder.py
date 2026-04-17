@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 BlueStacks Macro Recorder
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -53,6 +53,57 @@ def _key_to_str(key) -> str:
         return c if c is not None else str(key).replace("Key.", "")
     except AttributeError:
         return str(key).replace("Key.", "")
+
+
+def collapse_mouse_moves(actions: list[dict]) -> list[dict]:
+    """Merge consecutive mouse_move events into a single mouse_path action.
+
+    This dramatically reduces the number of cards shown in the editor while
+    keeping full fidelity for playback: each mouse_path stores all original
+    points and expands back to individual move frames in preprocess().
+    """
+    result: list[dict] = []
+    i = 0
+    while i < len(actions):
+        act = actions[i]
+        if act.get("type") != "mouse_move":
+            result.append(act)
+            i += 1
+            continue
+        # Collect run of consecutive mouse_move events
+        pts: list[dict] = []
+        while i < len(actions) and actions[i].get("type") == "mouse_move":
+            a = actions[i]
+            pts.append({"x": a["x"], "y": a["y"],
+                        "time": float(a.get("time", 0.0))})
+            i += 1
+        if len(pts) == 1:
+            # Single move — re-emit as mouse_move (not a path)
+            result.append({"type": "mouse_move",
+                           "x": pts[0]["x"], "y": pts[0]["y"],
+                           "time": pts[0]["time"]})
+        else:
+            result.append({
+                "type":     "mouse_path",
+                "points":   pts,
+                "time":     pts[0]["time"],
+                "time_end": pts[-1]["time"],
+            })
+    return result
+
+
+def expand_mouse_paths(actions: list[dict]) -> list[dict]:
+    """Inverse of collapse_mouse_moves — expand mouse_path back to mouse_moves."""
+    result: list[dict] = []
+    for act in actions:
+        if act.get("type") == "mouse_path":
+            for p in act.get("points", []):
+                result.append({"type": "mouse_move",
+                                "x": p["x"], "y": p["y"],
+                                "time": p["time"]})
+        else:
+            result.append(act)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,6 +563,10 @@ class Player:
         #   Pure tap: deferred fdown → guaranteed ≥80 ms dwell → fup
         #   Drag:     deferred fdown → fmoves → position-echo → fup
         #
+        # Expand any stored mouse_path groups back to individual moves
+        # before processing so the rest of this code is uniform.
+        actions = expand_mouse_paths(actions)
+
         TAP_MIN_DWELL = 0.080   # seconds; matches Android ViewConfiguration tap timeout
 
         frames: list[dict]         = []
@@ -583,27 +638,38 @@ class Player:
                             drag_wpts  = []
 
             # ─ move (drag waypoint) ───────────────────────────────────
-            elif t == "mouse_move":
-                if use_bin:
-                    if finger_down:
-                        tx, ty = to_t(act["x"], act["y"])
-                        last_tx, last_ty = tx, ty
-                        if pending_press is not None:
-                            # First move: commit deferred press as fdown.
-                            pp            = pending_press
-                            pending_press = None
-                            drag_active   = True
-                            frames.append({"time": pp["ts"], "orig": pp["orig"],
-                                           "touch": fdown(pp["tx"], pp["ty"]),
-                                           "is_fdown": True})
-                        frames.append({"time": ts, "orig": i,
-                                       "touch": fmove(tx, ty)})
+            elif t in ("mouse_move", "mouse_path"):
+                # mouse_path is a collapsed group of mouse_move points stored
+                # as {"type":"mouse_path","points":[{"x":..,"y":..,"time":..}],
+                #     "time":<first>, "time_end":<last>}
+                # Expand it the same way as individual mouse_moves.
+                move_pts: list[dict]
+                if t == "mouse_path":
+                    move_pts = act.get("points", [])
                 else:
-                    if drag_start is not None:
-                        ax, ay = to_d(act["x"], act["y"])
-                        if (not drag_wpts
-                                or (drag_wpts[-1][0], drag_wpts[-1][1]) != (ax, ay)):
-                            drag_wpts.append((ax, ay, ts))
+                    move_pts = [{"x": act["x"], "y": act["y"], "time": ts}]
+
+                for mp in move_pts:
+                    mp_ts = float(mp.get("time", ts))
+                    if use_bin:
+                        if finger_down:
+                            tx, ty = to_t(mp["x"], mp["y"])
+                            last_tx, last_ty = tx, ty
+                            if pending_press is not None:
+                                pp            = pending_press
+                                pending_press = None
+                                drag_active   = True
+                                frames.append({"time": pp["ts"], "orig": pp["orig"],
+                                               "touch": fdown(pp["tx"], pp["ty"]),
+                                               "is_fdown": True})
+                            frames.append({"time": mp_ts, "orig": i,
+                                           "touch": fmove(tx, ty)})
+                    else:
+                        if drag_start is not None:
+                            ax, ay = to_d(mp["x"], mp["y"])
+                            if (not drag_wpts
+                                    or (drag_wpts[-1][0], drag_wpts[-1][1]) != (ax, ay)):
+                                drag_wpts.append((ax, ay, mp_ts))
 
             # ─ scroll ─────────────────────────────────────────────────
             elif t == "mouse_scroll":
@@ -862,15 +928,22 @@ class Player:
 class ActionEditDialog(tk.Toplevel):
     """Modal dialog for editing a single action."""
 
-    def __init__(self, parent: tk.Misc, action: dict) -> None:
+    CREATABLE_TYPES = [
+        "mouse_click", "mouse_move", "mouse_scroll",
+        "key_press", "key_release", "delay",
+    ]
+
+    def __init__(self, parent: tk.Misc, action: dict,
+                 create_mode: bool = False) -> None:
         super().__init__(parent)
-        self.title("Edit Action")
+        self.title("Edit Action" if not create_mode else "New Action")
         self.resizable(False, False)
         self.grab_set()
         self.transient(parent)
         self.result: dict | None = None
-        self._orig   = action
+        self._orig        = action
         self._fields: dict[str, tk.Variable] = {}
+        self._create_mode = create_mode
         self._build()
         self.wait_window()
 
@@ -880,38 +953,85 @@ class ActionEditDialog(tk.Toplevel):
         frm.grid(sticky="nsew")
         self.columnconfigure(0, weight=1)
 
-        ttk.Label(frm, text=f"Type: {self._orig['type']}",
-                  font=("Segoe UI", 10, "bold")).grid(
-            row=0, columnspan=2, sticky="w", pady=(0, 10))
+        if self._create_mode:
+            ttk.Label(frm, text="Action type:",
+                      font=("Segoe UI", 9)).grid(
+                row=0, column=0, sticky="w", padx=8, pady=(0, 2))
+            self._type_var = tk.StringVar(value=self._orig.get("type", "mouse_click"))
+            cb = ttk.Combobox(frm, textvariable=self._type_var,
+                              values=self.CREATABLE_TYPES,
+                              state="readonly", width=18)
+            cb.grid(row=0, column=1, sticky="w", padx=8, pady=(0, 2))
+            cb.bind("<<ComboboxSelected>>", self._on_type_change)
+            self._fields_frm = ttk.Frame(frm)
+            self._fields_frm.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            self._build_fields(self._fields_frm, pad)
+            base_row = 2
+        else:
+            ttk.Label(frm, text=f"Type: {self._orig['type']}",
+                      font=("Segoe UI", 10, "bold")).grid(
+                row=0, columnspan=2, sticky="w", pady=(0, 10))
+            self._build_fields(frm, pad, start_row=1)
+            base_row = 100   # large enough
 
-        r = 1
-        for key, val in self._orig.items():
+        sep_row = base_row + len(self._fields) + 1
+        ttk.Separator(frm).grid(row=sep_row, columnspan=2,
+                                sticky="ew", pady=8)
+        btn_frm = ttk.Frame(frm)
+        btn_frm.grid(row=sep_row + 1, columnspan=2, sticky="e")
+        ttk.Button(btn_frm, text="Save",
+                   command=self._save).pack(side="right", padx=4)
+        ttk.Button(btn_frm, text="Cancel",
+                   command=self.destroy).pack(side="right")
+
+    def _on_type_change(self, _e=None) -> None:
+        for w in self._fields_frm.winfo_children():
+            w.destroy()
+        self._fields.clear()
+        t = self._type_var.get()
+        defaults = self._defaults_for(t)
+        self._orig = {"type": t, **defaults}
+        self._build_fields(self._fields_frm, {"padx": 8, "pady": 4})
+
+    @staticmethod
+    def _defaults_for(t: str) -> dict:
+        if t == "mouse_click":
+            return {"x": 0, "y": 0, "button": "left",
+                    "pressed": True, "time": 0.0}
+        if t == "mouse_move":
+            return {"x": 0, "y": 0, "time": 0.0}
+        if t == "mouse_scroll":
+            return {"x": 0, "y": 0, "dx": 0, "dy": -1, "time": 0.0}
+        if t in ("key_press", "key_release"):
+            return {"key": "a", "time": 0.0}
+        if t == "delay":
+            return {"duration": 1.0, "time": 0.0}
+        return {"time": 0.0}
+
+    def _build_fields(self, parent, pad, start_row: int = 0) -> None:
+        for r, (key, val) in enumerate(self._orig.items(), start=start_row):
             if key == "type":
                 continue
-            ttk.Label(frm, text=key + ":").grid(row=r, column=0, sticky="w", **pad)
+            ttk.Label(parent, text=key + ":").grid(
+                row=r, column=0, sticky="w", **pad)
             if isinstance(val, bool):
                 var: tk.Variable = tk.BooleanVar(value=val)
-                widget = ttk.Checkbutton(frm, variable=var)
+                widget = ttk.Checkbutton(parent, variable=var)
             else:
                 var = tk.StringVar(value=str(val))
-                widget = ttk.Entry(frm, textvariable=var, width=28)
+                widget = ttk.Entry(parent, textvariable=var, width=28)
             widget.grid(row=r, column=1, sticky="ew", **pad)
             self._fields[key] = var
-            r += 1
-
-        ttk.Separator(frm).grid(row=r, columnspan=2, sticky="ew", pady=8)
-        r += 1
-
-        btn_frm = ttk.Frame(frm)
-        btn_frm.grid(row=r, columnspan=2, sticky="e")
-        ttk.Button(btn_frm, text="Save",   command=self._save).pack(side="right", padx=4)
-        ttk.Button(btn_frm, text="Cancel", command=self.destroy).pack(side="right")
 
     def _save(self) -> None:
-        result = {"type": self._orig["type"]}
+        t = (self._type_var.get()
+             if self._create_mode else self._orig["type"])
+        result = {"type": t}
+        orig_ref = (self._defaults_for(t)
+                    if self._create_mode else self._orig)
         for key, var in self._fields.items():
             raw  = var.get()
-            orig = self._orig[key]
+            orig = orig_ref.get(key, raw)
             try:
                 if isinstance(orig, bool):
                     result[key] = bool(raw)
@@ -928,6 +1048,394 @@ class ActionEditDialog(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DragCardList  — scrollable card list with drag-to-reorder support
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DragCardList(tk.Frame):
+    """
+    A scrollable list of "cards" (tk.Frame) that can be:
+      • Clicked to select (single) / Ctrl-/Shift-clicked for multi-select
+      • Dragged to reorder
+      • Double-clicked to trigger an edit callback
+
+    Public API
+    ----------
+    set_cards(items)   — rebuild from a list of dicts (action data)
+    get_order()        — return the current list of action dicts in display order
+    selection()        — return list of currently-selected indices
+    select(index)      — programmatically select one card
+    clear_playing()    — remove the "playing" highlight from all cards
+    set_playing(index) — highlight one card as the currently-playing one
+    on_reorder         — callback(new_action_list) fired after drag
+    on_edit            — callback(index) fired on double-click
+    on_select          — callback(selected_indices) fired on selection change
+    """
+
+    _CARD_H     = 54   # px per card
+    _PAD        = 3    # gap between cards
+    _SEL_BG     = "#cce5ff"
+    _PLAY_BG    = "#ffe0a0"
+    _CARD_BG    = "#f8f8f8"
+    _DRAG_ALPHA = "#d0e8ff"
+    _MOVE_FILL  = "#4a90d9"   # colour for path canvas
+
+    def __init__(self, master, on_reorder=None, on_edit=None,
+                 on_select=None, **kw):
+        super().__init__(master, **kw)
+        self.on_reorder = on_reorder
+        self.on_edit    = on_edit
+        self.on_select  = on_select
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self._canvas = tk.Canvas(self, highlightthickness=0, bg="#ececec")
+        self._vsb    = ttk.Scrollbar(self, orient="vertical",
+                                     command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        self._vsb.grid(row=0, column=1, sticky="ns")
+
+        self._inner = tk.Frame(self._canvas, bg="#ececec")
+        self._win_id = self._canvas.create_window(
+            (0, 0), window=self._inner, anchor="nw")
+
+        self._inner.bind("<Configure>", self._on_inner_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        self._canvas.bind("<MouseWheel>", self._on_mousewheel)
+
+        self._cards:      list[tk.Frame] = []
+        self._actions:    list[dict]     = []
+        self._selected:   set[int]       = set()
+        self._playing_idx: int | None    = None
+
+        # drag state
+        self._drag_src:    int | None  = None
+        self._drag_ghost:  tk.Frame | None = None
+        self._drag_y_off:  int = 0
+        self._drag_target: int | None  = None
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def set_cards(self, items: list[dict]) -> None:
+        self._selected.clear()
+        self._playing_idx = None
+        for w in self._inner.winfo_children():
+            w.destroy()
+        self._cards   = []
+        self._actions = list(items)
+        for i, act in enumerate(self._actions):
+            self._cards.append(self._make_card(i, act))
+        self._repack()
+
+    def get_order(self) -> list[dict]:
+        return list(self._actions)
+
+    def selection(self) -> list[int]:
+        return sorted(self._selected)
+
+    def select(self, index: int) -> None:
+        self._selected = {index}
+        self._refresh_colors()
+        if 0 <= index < len(self._cards):
+            self._scroll_to(index)
+        if self.on_select:
+            self.on_select(self.selection())
+
+    def clear_playing(self) -> None:
+        self._playing_idx = None
+        self._refresh_colors()
+
+    def set_playing(self, index: int) -> None:
+        self._playing_idx = index
+        self._refresh_colors()
+        self._scroll_to(index)
+
+    # ── card factory ─────────────────────────────────────────────────────────
+
+    def _make_card(self, i: int, act: dict) -> tk.Frame:
+        frm = tk.Frame(self._inner, bg=self._CARD_BG,
+                       relief="solid", bd=1,
+                       height=self._CARD_H)
+        frm.pack_propagate(False)
+
+        t = act.get("type", "")
+
+        # left colour stripe
+        stripe_col = {
+            "mouse_click":   "#4a90d9",
+            "mouse_scroll":  "#9b59b6",
+            "mouse_move":    "#27ae60",
+            "mouse_path":    "#27ae60",
+            "key_press":     "#e67e22",
+            "key_release":   "#e67e22",
+            "delay":         "#95a5a6",
+        }.get(t, "#aaaaaa")
+        tk.Frame(frm, bg=stripe_col, width=6).pack(side="left", fill="y")
+
+        body = tk.Frame(frm, bg=self._CARD_BG)
+        body.pack(side="left", fill="both", expand=True, padx=6, pady=4)
+
+        # ── Index badge + type label ──────────────────────────────────
+        hdr = tk.Frame(body, bg=self._CARD_BG)
+        hdr.pack(fill="x")
+
+        tk.Label(hdr, text=f"#{i + 1}", font=("Segoe UI", 7),
+                 fg="#aaaaaa", bg=self._CARD_BG,
+                 width=4, anchor="w").pack(side="left")
+
+        type_label = {
+            "mouse_click":  "Click",
+            "mouse_scroll": "Scroll",
+            "mouse_move":   "Move",
+            "mouse_path":   "Path  (drag)",
+            "key_press":    "Key ▼",
+            "key_release":  "Key ▲",
+            "delay":        "Delay",
+        }.get(t, t)
+        tk.Label(hdr, text=type_label, font=("Segoe UI", 9, "bold"),
+                 fg="#333333", bg=self._CARD_BG, anchor="w").pack(side="left", padx=4)
+
+        ts = act.get("time", "")
+        tk.Label(hdr, text=f"{float(ts):.3f} s" if ts != "" else "",
+                 font=("Segoe UI", 7), fg="#888888",
+                 bg=self._CARD_BG, anchor="e").pack(side="right", padx=4)
+
+        # ── Detail / minimap ──────────────────────────────────────────
+        if t == "mouse_path":
+            self._add_path_minimap(body, act)
+        else:
+            detail = self._fmt_detail(act)
+            tk.Label(body, text=detail, font=("Segoe UI", 9),
+                     fg="#555555", bg=self._CARD_BG,
+                     anchor="w", wraplength=460).pack(fill="x")
+
+        # bind interactions — every child widget must also forward events
+        for w in self._iter_descendants(frm):
+            w.bind("<Button-1>",        lambda e, idx=i: self._on_click(e, idx))
+            w.bind("<Double-Button-1>", lambda e, idx=i: self._on_dbl(e, idx))
+            w.bind("<B1-Motion>",       lambda e, idx=i: self._on_drag(e, idx))
+            w.bind("<ButtonRelease-1>", lambda e, idx=i: self._on_drop(e, idx))
+
+        frm._action_index = i   # type: ignore[attr-defined]
+        return frm
+
+    def _add_path_minimap(self, parent: tk.Frame, act: dict) -> None:
+        """Draw a tiny polyline of the recorded path."""
+        pts = act.get("points", [])
+        if not pts:
+            return
+        MW, MH = 120, 30
+        cv = tk.Canvas(parent, width=MW, height=MH,
+                       bg=self._CARD_BG, highlightthickness=0)
+        cv.pack(side="left", padx=(0, 6))
+        xs = [p["x"] for p in pts]
+        ys = [p["y"] for p in pts]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        dx = max(xmax - xmin, 1)
+        dy = max(ymax - ymin, 1)
+        margin = 4
+        def sc(px, py):
+            return (
+                margin + int((px - xmin) / dx * (MW - 2 * margin)),
+                margin + int((py - ymin) / dy * (MH - 2 * margin)),
+            )
+        coords: list[int] = []
+        for p in pts:
+            cx2, cy2 = sc(p["x"], p["y"])
+            coords += [cx2, cy2]
+        if len(coords) >= 4:
+            cv.create_line(*coords, fill=self._MOVE_FILL,
+                           width=2, smooth=True)
+        # start dot
+        sx, sy = sc(pts[0]["x"], pts[0]["y"])
+        cv.create_oval(sx-3, sy-3, sx+3, sy+3, fill="#27ae60", outline="")
+        # end dot
+        ex, ey = sc(pts[-1]["x"], pts[-1]["y"])
+        cv.create_oval(ex-3, ey-3, ex+3, ey+3, fill="#e74c3c", outline="")
+
+        n = len(pts)
+        tk.Label(parent, text=f"{n} pts\n{float(act.get('time',0)):.3f}→{float(act.get('time_end',0)):.3f}s",
+                 font=("Segoe UI", 7), fg="#777777",
+                 bg=self._CARD_BG, justify="left").pack(side="left")
+
+    @staticmethod
+    def _fmt_detail(act: dict) -> str:
+        t = act.get("type", "")
+        if t == "mouse_click":
+            arrow = "▼ press" if act.get("pressed") else "▲ release"
+            return f"x={act.get('x')}, y={act.get('y')}   btn={act.get('button')}  {arrow}"
+        if t == "mouse_move":
+            return f"x={act.get('x')}, y={act.get('y')}"
+        if t == "mouse_scroll":
+            return (f"x={act.get('x')}, y={act.get('y')}   "
+                    f"dx={act.get('dx')}, dy={act.get('dy')}")
+        if t in ("key_press", "key_release"):
+            arrow = "▼" if t == "key_press" else "▲"
+            return f"key = {act.get('key')}  {arrow}"
+        if t == "delay":
+            return f"wait  {act.get('duration', 0)} s"
+        return str({k: v for k, v in act.items()
+                    if k not in ("type", "time")})
+
+    @staticmethod
+    def _iter_descendants(widget):
+        yield widget
+        for child in widget.winfo_children():
+            yield from DragCardList._iter_descendants(child)
+
+    # ── interaction ───────────────────────────────────────────────────────────
+
+    def _on_click(self, event, idx: int) -> None:
+        if (event.state & 0x0004):   # Ctrl
+            if idx in self._selected:
+                self._selected.discard(idx)
+            else:
+                self._selected.add(idx)
+        elif (event.state & 0x0001):  # Shift
+            if self._selected:
+                anchor = min(self._selected)
+                lo, hi = min(anchor, idx), max(anchor, idx)
+                self._selected = set(range(lo, hi + 1))
+            else:
+                self._selected = {idx}
+        else:
+            self._selected = {idx}
+        self._refresh_colors()
+        if self.on_select:
+            self.on_select(self.selection())
+        # remember start position for drag detection
+        self._drag_src   = idx
+        self._drag_y_off = event.y_root - self._cards[idx].winfo_rooty()
+
+    def _on_dbl(self, event, idx: int) -> None:
+        self._selected = {idx}
+        self._refresh_colors()
+        if self.on_edit:
+            self.on_edit(idx)
+
+    def _on_drag(self, event, idx: int) -> None:
+        if self._drag_src is None:
+            return
+        # Only start ghost after moving 5px
+        gy = event.y_root
+        if self._drag_ghost is None:
+            if abs(gy - (self._cards[idx].winfo_rooty()
+                         + self._drag_y_off)) < 5:
+                return
+            self._create_ghost(idx)
+
+        # Move ghost
+        if self._drag_ghost:
+            canvas_y = (gy - self._canvas.winfo_rooty()
+                        + self._canvas.yview()[0]
+                         * self._inner.winfo_reqheight())
+            ghost_y  = canvas_y - self._drag_y_off
+            self._drag_ghost.place(
+                x=2, y=int(ghost_y),
+                width=self._inner.winfo_width() - 4)
+            # Calculate drop target
+            self._drag_target = self._y_to_index(canvas_y)
+            self._refresh_colors()
+
+    def _on_drop(self, event, idx: int) -> None:
+        if self._drag_ghost is not None:
+            self._drag_ghost.destroy()
+            self._drag_ghost = None
+            tgt = self._drag_target
+            if tgt is not None and tgt != self._drag_src:
+                self._do_reorder(self._drag_src, tgt)
+        self._drag_src    = None
+        self._drag_target = None
+
+    def _create_ghost(self, idx: int) -> None:
+        src = self._cards[idx]
+        self._drag_ghost = tk.Frame(
+            self._inner,
+            bg=self._DRAG_ALPHA,
+            relief="solid", bd=1,
+            height=self._CARD_H)
+        self._drag_ghost.place(
+            x=2, y=src.winfo_y(),
+            width=self._inner.winfo_width() - 4)
+        tk.Label(self._drag_ghost,
+                 text=f"Moving: #{idx + 1}",
+                 bg=self._DRAG_ALPHA,
+                 font=("Segoe UI", 9, "italic")).place(
+            relx=0.5, rely=0.5, anchor="center")
+
+    def _y_to_index(self, canvas_y: float) -> int:
+        step = self._CARD_H + self._PAD
+        idx  = int(canvas_y // step)
+        return max(0, min(idx, len(self._cards) - 1))
+
+    def _do_reorder(self, src: int, tgt: int) -> None:
+        act = self._actions.pop(src)
+        self._actions.insert(tgt, act)
+        self._selected = {tgt}
+        self.set_cards(self._actions)   # full rebuild
+        if self.on_reorder:
+            self.on_reorder(list(self._actions))
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _repack(self) -> None:
+        for c in self._cards:
+            c.pack(fill="x", padx=4,
+                   pady=(self._PAD, 0))
+
+    def _refresh_colors(self) -> None:
+        for i, card in enumerate(self._cards):
+            if i == self._playing_idx:
+                bg = self._PLAY_BG
+            elif i in self._selected:
+                bg = self._SEL_BG
+            elif i == self._drag_target and self._drag_ghost:
+                bg = "#e0f0ff"
+            else:
+                bg = self._CARD_BG
+            self._set_bg_recursive(card, bg)
+
+    def _set_bg_recursive(self, widget, bg: str) -> None:
+        try:
+            widget.config(bg=bg)
+        except tk.TclError:
+            pass
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Canvas):
+                continue   # don't recolor canvas — it owns its own bg
+            self._set_bg_recursive(child, bg)
+
+    def _scroll_to(self, index: int) -> None:
+        if not self._cards or index >= len(self._cards):
+            return
+        inner_h = self._inner.winfo_reqheight()
+        if inner_h <= 0:
+            return
+        step = self._CARD_H + self._PAD
+        card_top = index * step
+        card_bot = card_top + self._CARD_H
+        view_top = self._canvas.yview()[0] * inner_h
+        view_bot = view_top + self._canvas.winfo_height()
+        if card_top < view_top:
+            self._canvas.yview_moveto(card_top / inner_h)
+        elif card_bot > view_bot:
+            self._canvas.yview_moveto(
+                (card_bot - self._canvas.winfo_height()) / inner_h)
+
+    def _on_inner_configure(self, _e=None) -> None:
+        self._canvas.configure(
+            scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, e) -> None:
+        self._canvas.itemconfig(self._win_id, width=e.width)
+
+    def _on_mousewheel(self, e) -> None:
+        self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main application
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -935,8 +1443,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("BlueStacks Macro Recorder")
-        self.geometry("1200x720")
-        self.minsize(900, 540)
+        self.geometry("1300x760")
+        self.minsize(960, 560)
 
         self._apply_style()
 
@@ -948,6 +1456,9 @@ class App(tk.Tk):
         self._recording    = False
         self._rec_t0: float = 0.0
         self._timer_cb     = None
+        # Continue-recording state
+        self._cont_mode:        str  = "append"    # "prepend"|"append"|"after_sel"
+        self._cont_insert_idx:  int  = -1          # used in "after_sel" mode
 
         self._player       = Player(on_action=self._playback_action_cb,
                                     on_done=self._playback_done_cb)
@@ -1086,22 +1597,40 @@ class App(tk.Tk):
 
         ttk.Label(rec, text="Profile name:").grid(row=0, column=0, sticky="w")
         self._rec_name = tk.StringVar(value=self._new_name())
-        ttk.Entry(rec, textvariable=self._rec_name, width=36).grid(
+        ttk.Entry(rec, textvariable=self._rec_name, width=30).grid(
             row=0, column=1, sticky="ew", padx=6)
 
         self._lbl_rec_stat = ttk.Label(rec, text="Ready")
-        self._lbl_rec_stat.grid(row=0, column=2, padx=10)
+        self._lbl_rec_stat.grid(row=0, column=2, padx=8)
 
         self._lbl_timer = ttk.Label(
             rec, text="00:00.0", font=("Consolas", 13, "bold"))
-        self._lbl_timer.grid(row=0, column=3, padx=6)
+        self._lbl_timer.grid(row=0, column=3, padx=4)
 
         self._btn_rec = ttk.Button(
-            rec, text="⏺  Start Recording", command=self._toggle_recording)
-        self._btn_rec.grid(row=0, column=4, padx=6)
+            rec, text="⏺  New Recording", command=self._toggle_recording)
+        self._btn_rec.grid(row=0, column=4, padx=4)
 
-        ttk.Label(rec, text="(F8 to stop)", foreground="gray").grid(
-            row=0, column=5, padx=4)
+        # Continue Recording controls
+        self._btn_cont = ttk.Button(
+            rec, text="⏺  Continue Recording",
+            command=self._toggle_continue_recording,
+            state="disabled")
+        self._btn_cont.grid(row=0, column=5, padx=4)
+
+        cont_mode_frm = ttk.Frame(rec)
+        cont_mode_frm.grid(row=0, column=6, padx=(4, 0))
+        ttk.Label(cont_mode_frm, text="at:", foreground="gray").pack(side="left")
+        self._cont_mode_var = tk.StringVar(value="append")
+        for lbl, val in (("end", "append"), ("start", "prepend"),
+                         ("after selected", "after_sel")):
+            ttk.Radiobutton(
+                cont_mode_frm, text=lbl,
+                variable=self._cont_mode_var, value=val,
+            ).pack(side="left", padx=2)
+
+        ttk.Label(rec, text="(F8 stop)", foreground="gray").grid(
+            row=0, column=7, padx=4)
 
         # ─ Playback section ───────────────────────────────────────────────────
         play_frm = ttk.LabelFrame(right, text="Playback", padding=8)
@@ -1127,7 +1656,7 @@ class App(tk.Tk):
         self._lbl_play_info = ttk.Label(play_frm, text="", foreground="gray")
         self._lbl_play_info.grid(row=0, column=4, padx=(0, 4))
 
-        ttk.Label(play_frm, text="(F9 to stop)", foreground="gray").grid(
+        ttk.Label(play_frm, text="(F9 stop)", foreground="gray").grid(
             row=0, column=5, padx=4)
 
         # ─ Actions editor ─────────────────────────────────────────────────────
@@ -1137,27 +1666,13 @@ class App(tk.Tk):
         self._act_frame.columnconfigure(0, weight=1)
         self._act_frame.rowconfigure(0, weight=1)
 
-        cols = ("No.", "Type", "Details", "Time (s)")
-        self._tree = ttk.Treeview(
-            self._act_frame, columns=cols, show="headings", selectmode="extended")
-        for c in cols:
-            self._tree.heading(c, text=c)
-        self._tree.column("No.",      width=54,  stretch=False, anchor="center")
-        self._tree.column("Type",     width=125, stretch=False)
-        self._tree.column("Details",  width=420)
-        self._tree.column("Time (s)", width=88,  stretch=False, anchor="e")
-
-        # tag for highlighting current playback action
-        self._tree.tag_configure("playing", background="#cce5ff")
-
-        vsb2 = ttk.Scrollbar(
-            self._act_frame, orient="vertical", command=self._tree.yview)
-        self._tree.configure(yscrollcommand=vsb2.set)
-        self._tree.grid(row=0, column=0, sticky="nsew")
-        vsb2.grid(row=0, column=1, sticky="ns")
-
-        self._tree.bind("<Double-Button-1>", self._edit_action)
-        self._tree.bind("<Button-3>",        self._ctx_menu)
+        self._card_list = DragCardList(
+            self._act_frame,
+            on_reorder=self._on_cards_reorder,
+            on_edit=self._edit_action_by_index,
+            on_select=self._on_card_select,
+        )
+        self._card_list.grid(row=0, column=0, sticky="nsew")
 
         # ─ Action toolbar ─────────────────────────────────────────────────────
         atb = ttk.Frame(right)
@@ -1165,16 +1680,18 @@ class App(tk.Tk):
 
         self._abt: dict[str, ttk.Button] = {}
         specs = [
-            ("edit",      "Edit",       self._edit_action),
-            ("dup",       "Duplicate",  self._duplicate_action),
-            ("del",       "Delete",     self._delete_actions),
-            ("up",        "▲ Up",       self._move_up),
-            ("down",      "▼ Down",     self._move_down),
-            ("delay",     "+ Delay",    self._add_delay),
-            ("clear_all", "Clear All",  self._clear_all_actions),
+            ("add",       "+ Add Action",  self._add_action),
+            ("edit",      "Edit",          self._edit_action),
+            ("dup",       "Duplicate",     self._duplicate_action),
+            ("del",       "Delete",        self._delete_actions),
+            ("up",        "▲ Up",          self._move_up),
+            ("down",      "▼ Down",        self._move_down),
+            ("delay",     "+ Delay",       self._add_delay),
+            ("clear_all", "Clear All",     self._clear_all_actions),
         ]
         for key, label, cmd in specs:
-            b = ttk.Button(atb, text=label, command=cmd, state="disabled")
+            st = "normal" if key == "add" else "disabled"
+            b = ttk.Button(atb, text=label, command=cmd, state=st)
             b.pack(side="left", padx=2)
             self._abt[key] = b
 
@@ -1211,16 +1728,22 @@ class App(tk.Tk):
             self._set_act_state("normal")
             if not self._playing and not self._recording:
                 self._btn_play.config(state="normal")
+                self._btn_cont.config(state="normal")
         else:
             self._cur_profile = None
             self._clear_actions_view()
             self._set_act_state("disabled")
             if not self._playing:
                 self._btn_play.config(state="disabled")
+            self._btn_cont.config(state="disabled")
 
     def _set_act_state(self, state: str) -> None:
-        for b in self._abt.values():
-            b.config(state=state)
+        for key, b in self._abt.items():
+            # "add" is always enabled when a profile is loaded
+            if key == "add":
+                b.config(state="normal" if state == "normal" else "disabled")
+            else:
+                b.config(state=state)
 
     def _delete_profiles(self) -> None:
         sel = self._plist.curselection()
@@ -1300,52 +1823,49 @@ class App(tk.Tk):
         if not self._cur_profile:
             return
         actions = self._cur_profile.get("actions", [])
-        for i, act in enumerate(actions):
-            self._insert_row(i, act)
+        self._card_list.set_cards(actions)
         n = len(actions)
         self._lbl_count.config(text=f"{n} action(s)")
         self._act_frame.config(
             text=(f"Actions  —  {self._cur_profile.get('name', 'Unnamed')} "
-                  f" ({n} actions)"))
-
-    def _insert_row(self, i: int, act: dict) -> None:
-        self._tree.insert(
-            "", "end", iid=str(i),
-            values=(i + 1, act.get("type", ""), self._fmt(act), act.get("time", "")))
-
-    @staticmethod
-    def _fmt(act: dict) -> str:
-        t = act.get("type", "")
-        if t == "mouse_move":
-            return f"x={act['x']}, y={act['y']}"
-        if t == "mouse_click":
-            arrow = "▼" if act.get("pressed") else "▲"
-            return f"x={act['x']}, y={act['y']},  {act.get('button')} {arrow}"
-        if t == "mouse_scroll":
-            return (f"x={act['x']}, y={act['y']},  "
-                    f"dx={act.get('dx')}, dy={act.get('dy')}")
-        if t in ("key_press", "key_release"):
-            arrow = "▼" if t == "key_press" else "▲"
-            return f"key={act.get('key')}  {arrow}"
-        if t == "delay":
-            return f"wait  {act.get('duration', 0)} s"
-        return str({k: v for k, v in act.items() if k not in ("type", "time")})
+                  f"({n} actions)"))
 
     def _clear_actions_view(self) -> None:
-        for it in self._tree.get_children():
-            self._tree.delete(it)
+        self._card_list.set_cards([])
         self._lbl_count.config(text="")
         self._act_frame.config(text="Actions  (select a profile)")
+
+    # ── Card callbacks ────────────────────────────────────────────────────────
+
+    def _on_cards_reorder(self, new_actions: list[dict]) -> None:
+        if not self._cur_profile:
+            return
+        self._cur_profile["actions"] = new_actions
+        self._pm.save(self._cur_profile)
+        n = len(new_actions)
+        self._lbl_count.config(text=f"{n} action(s)")
+
+    def _on_card_select(self, indices: list[int]) -> None:
+        # Enable/disable toolbar buttons that require a selection
+        has_sel = bool(indices)
+        single  = len(indices) == 1
+        for key in ("edit", "dup", "del", "up", "down", "delay"):
+            self._abt[key].config(
+                state="normal" if (has_sel and self._cur_profile) else "disabled")
 
     # ── Action editing ────────────────────────────────────────────────────────
 
     def _edit_action(self, _event=None) -> None:
         if not self._cur_profile:
             return
-        sel = self._tree.selection()
+        sel = self._card_list.selection()
         if not sel:
             return
-        idx     = int(sel[0])
+        self._edit_action_by_index(sel[0])
+
+    def _edit_action_by_index(self, idx: int) -> None:
+        if not self._cur_profile:
+            return
         actions = self._cur_profile["actions"]
         if idx >= len(actions):
             return
@@ -1354,17 +1874,34 @@ class App(tk.Tk):
             actions[idx] = dlg.result
             self._pm.save(self._cur_profile)
             self._reload_actions()
-            if str(idx) in self._tree.get_children():
-                self._tree.selection_set(str(idx))
-                self._tree.see(str(idx))
+            self._card_list.select(idx)
+
+    def _add_action(self) -> None:
+        """Insert a brand-new action from scratch."""
+        if not self._cur_profile:
+            return
+        sel = self._card_list.selection()
+        acts = self._cur_profile["actions"]
+        at = sel[0] + 1 if sel else len(acts)
+        prev_t = float(acts[at - 1].get("time", 0.0)) if at > 0 and acts else 0.0
+        blank = {"type": "mouse_click", "x": 0, "y": 0,
+                 "button": "left", "pressed": True,
+                 "time": round(prev_t + 0.1, 4)}
+        dlg = ActionEditDialog(self, blank, create_mode=True)
+        if dlg.result is not None:
+            acts.insert(at, dlg.result)
+            self._pm.save(self._cur_profile)
+            self._reload_actions()
+            self._card_list.select(at)
+            self._set_status("Action added.")
 
     def _delete_actions(self) -> None:
         if not self._cur_profile:
             return
-        sel = self._tree.selection()
+        sel = self._card_list.selection()
         if not sel:
             return
-        indices = sorted((int(s) for s in sel), reverse=True)
+        indices = sorted(sel, reverse=True)
         acts = self._cur_profile["actions"]
         for i in indices:
             if 0 <= i < len(acts):
@@ -1382,10 +1919,10 @@ class App(tk.Tk):
     def _swap_action(self, delta: int) -> None:
         if not self._cur_profile:
             return
-        sel = self._tree.selection()
+        sel = self._card_list.selection()
         if len(sel) != 1:
             return
-        idx  = int(sel[0])
+        idx  = sel[0]
         acts = self._cur_profile["actions"]
         new  = idx + delta
         if not (0 <= new < len(acts)):
@@ -1393,22 +1930,20 @@ class App(tk.Tk):
         acts[idx], acts[new] = acts[new], acts[idx]
         self._pm.save(self._cur_profile)
         self._reload_actions()
-        if str(new) in self._tree.get_children():
-            self._tree.selection_set(str(new))
-            self._tree.see(str(new))
+        self._card_list.select(new)
 
     def _add_delay(self) -> None:
         if not self._cur_profile:
             return
-        sel = self._tree.selection()
+        sel = self._card_list.selection()
         dur = simpledialog.askfloat(
             "Add Delay", "Delay duration (seconds):",
             initialvalue=1.0, minvalue=0.01, maxvalue=300.0, parent=self)
         if dur is None:
             return
         acts = self._cur_profile["actions"]
-        at   = int(sel[0]) + 1 if sel else len(acts)
-        prev_t = acts[at - 1]["time"] if at > 0 and acts else 0.0
+        at   = sel[0] + 1 if sel else len(acts)
+        prev_t = float(acts[at - 1].get("time", 0.0)) if at > 0 and acts else 0.0
         acts.insert(at, {
             "type":     "delay",
             "duration": round(dur, 3),
@@ -1416,19 +1951,21 @@ class App(tk.Tk):
         })
         self._pm.save(self._cur_profile)
         self._reload_actions()
+        self._card_list.select(at)
 
     def _duplicate_action(self) -> None:
         if not self._cur_profile:
             return
-        sel = self._tree.selection()
+        sel = self._card_list.selection()
         if not sel:
             return
-        idx  = int(sel[0])
+        idx  = sel[0]
         acts = self._cur_profile["actions"]
         dup  = copy.deepcopy(acts[idx])
         acts.insert(idx + 1, dup)
         self._pm.save(self._cur_profile)
         self._reload_actions()
+        self._card_list.select(idx + 1)
 
     def _clear_all_actions(self) -> None:
         if not self._cur_profile:
@@ -1440,39 +1977,36 @@ class App(tk.Tk):
         self._cur_profile["actions"] = []
         self._pm.save(self._cur_profile)
         self._reload_actions()
-
-    def _ctx_menu(self, event) -> None:
-        row = self._tree.identify_row(event.y)
-        if not row:
-            return
-        self._tree.selection_set(row)
-        m = tk.Menu(self, tearoff=0)
-        m.add_command(label="Edit",            command=self._edit_action)
-        m.add_command(label="Duplicate",       command=self._duplicate_action)
-        m.add_command(label="Delete",          command=self._delete_actions)
-        m.add_separator()
-        m.add_command(label="Move Up",         command=self._move_up)
-        m.add_command(label="Move Down",       command=self._move_down)
-        m.add_separator()
-        m.add_command(label="Add Delay After", command=self._add_delay)
         m.tk_popup(event.x_root, event.y_root)
 
     # ── Recording ─────────────────────────────────────────────────────────────
 
     def _toggle_recording(self) -> None:
         if not self._recording:
-            self._start_recording()
+            self._start_recording(continue_mode=False)
         else:
             self._recorder.stop()
 
-    def _start_recording(self) -> None:
+    def _toggle_continue_recording(self) -> None:
+        """Append/prepend/insert new recording into the current profile."""
+        if not self._cur_profile:
+            return
+        if not self._recording:
+            self._cont_mode = self._cont_mode_var.get()
+            sel = self._card_list.selection()
+            self._cont_insert_idx = sel[0] if sel else -1
+            self._start_recording(continue_mode=True)
+        else:
+            self._recorder.stop()
+
+    def _start_recording(self, continue_mode: bool = False) -> None:
         if not PYNPUT_OK:
             messagebox.showerror(
                 "Missing dependency",
                 "pynput is not installed.\n\nFix it by running:\n\n"
                 "    pip install pynput\n\nthen restart the application.")
             return
-        # Snapshot BlueStacks window position for ADB coordinate mapping
+        self._continue_mode = continue_mode
         title = self._win_title_var.get().strip()
         self._rec_window_rect = _find_window_rect(title) if title else None
         if self._rec_window_rect is None:
@@ -1481,13 +2015,18 @@ class App(tk.Tk):
                 "check the 'BS Window Title' field. Coordinates may be wrong at playback.")
         self._recording = True
         self._rec_t0    = time.perf_counter()
-        self._rec_name.set(self._new_name())
-        self._lbl_rec_stat.config(text="● REC", foreground="#cc0000")
-        self._btn_rec.config(text="⏹  Stop Recording")
-        self._btn_play.config(state="disabled")   # can't play while recording
+        if not continue_mode:
+            self._rec_name.set(self._new_name())
+        label = "⏹  Stop" if continue_mode else "⏹  Stop Recording"
+        (self._btn_cont if continue_mode else self._btn_rec).config(text=label)
+        self._btn_play.config(state="disabled")
+        self._btn_rec.config(state="disabled" if continue_mode else "normal")
+        self._btn_cont.config(state="disabled" if not continue_mode else "normal")
+        lbl = "● CONT" if continue_mode else "● REC"
+        self._lbl_rec_stat.config(text=lbl, foreground="#cc0000")
         self._tick()
         self._recorder.start()
-        self.iconify()   # minimise so user can interact with BlueStacks freely
+        self.iconify()
 
     def _recording_stopped(self, actions: list[dict]) -> None:
         """Called from a helper thread — schedules back to main thread."""
@@ -1500,40 +2039,89 @@ class App(tk.Tk):
             self.after_cancel(self._timer_cb)
             self._timer_cb = None
         self._lbl_rec_stat.config(text="Ready", foreground="")
-        self._btn_rec.config(text="⏺  Start Recording")
-        self._lbl_timer.config(text="00:00.0")
-        # re-enable play if a profile is already selected
+        self._btn_rec.config(text="⏺  New Recording", state="normal")
         if self._cur_profile:
+            self._btn_cont.config(state="normal")
             self._btn_play.config(state="normal")
+        else:
+            self._btn_cont.config(state="disabled")
+        self._lbl_timer.config(text="00:00.0")
         self.deiconify()
         self.lift()
         self.focus_force()
 
         if not actions:
+            if getattr(self, "_continue_mode", False):
+                return   # nothing added — silently ignore
             messagebox.showinfo("Recording", "No actions were recorded.")
             return
 
-        name = self._rec_name.get().strip() or self._new_name()
-        profile = {
-            "id":          str(uuid.uuid4()),
-            "name":        name,
-            "created":     datetime.now().isoformat(),
-            "device":      self._device_var.get(),
-            "window_rect": list(self._rec_window_rect) if self._rec_window_rect else None,
-            "actions":     actions,
-        }
-        self._pm.save(profile)
-        self._profiles.append(profile)
-        self._plist.insert("end", name)
-        new_idx = len(self._profiles) - 1
-        self._plist.selection_clear(0, "end")
-        self._plist.selection_set(new_idx)
-        self._plist.see(new_idx)
-        self._on_profile_sel()
-        self._set_status(f"Profile '{name}' saved — {len(actions)} actions.")
-        messagebox.showinfo(
-            "Recording saved",
-            f"Profile \"{name}\" saved.\n{len(actions)} actions recorded.")
+        # Collapse consecutive mouse_move events into mouse_path groups
+        collapsed = collapse_mouse_moves(actions)
+
+        if getattr(self, "_continue_mode", False) and self._cur_profile:
+            # ── Continue mode: merge into existing profile ──────────────────
+            existing = self._cur_profile.get("actions", [])
+            mode     = getattr(self, "_cont_mode", "append")
+            if mode == "prepend":
+                # Re-timestamp new actions so they start before existing ones.
+                # Shift existing actions forward by the duration of new recording.
+                new_dur = float(collapsed[-1].get("time", 0.0)) if collapsed else 0.0
+                for ea in existing:
+                    ea["time"] = round(float(ea.get("time", 0.0)) + new_dur + 0.5, 4)
+                merged = collapsed + existing
+            elif mode == "after_sel":
+                insert_at = getattr(self, "_cont_insert_idx", -1)
+                if insert_at < 0 or insert_at >= len(existing):
+                    insert_at = len(existing)
+                # Re-timestamp: offset new actions to follow the action at insert_at
+                base_t = float(existing[insert_at].get("time", 0.0)) if existing else 0.0
+                shift  = base_t + 0.1
+                for na in collapsed:
+                    na["time"] = round(float(na.get("time", 0.0)) + shift, 4)
+                # Shift remaining existing actions forward too
+                new_dur = float(collapsed[-1].get("time", 0.0)) if collapsed else 0.0
+                tail_shift = new_dur + 0.1
+                for ea in existing[insert_at + 1:]:
+                    ea["time"] = round(float(ea.get("time", 0.0)) + tail_shift, 4)
+                merged = existing[:insert_at + 1] + collapsed + existing[insert_at + 1:]
+            else:  # append
+                # Offset new actions so they follow the last existing action
+                base_t = float(existing[-1].get("time", 0.0)) if existing else 0.0
+                shift  = base_t + 0.5
+                for na in collapsed:
+                    na["time"] = round(float(na.get("time", 0.0)) + shift, 4)
+                merged = existing + collapsed
+            self._cur_profile["actions"] = merged
+            self._pm.save(self._cur_profile)
+            self._reload_actions()
+            n = len(collapsed)
+            self._set_status(
+                f"Added {n} action(s) to '{self._cur_profile.get('name', '')}'.")
+        else:
+            # ── New profile ──────────────────────────────────────────────────
+            name = self._rec_name.get().strip() or self._new_name()
+            profile = {
+                "id":          str(uuid.uuid4()),
+                "name":        name,
+                "created":     datetime.now().isoformat(),
+                "device":      self._device_var.get(),
+                "window_rect": list(self._rec_window_rect) if self._rec_window_rect else None,
+                "actions":     collapsed,
+            }
+            self._pm.save(profile)
+            self._profiles.append(profile)
+            self._plist.insert("end", name)
+            new_idx = len(self._profiles) - 1
+            self._plist.selection_clear(0, "end")
+            self._plist.selection_set(new_idx)
+            self._plist.see(new_idx)
+            self._on_profile_sel()
+            n = len(collapsed)
+            self._set_status(f"Profile '{name}' saved — {n} actions.")
+            messagebox.showinfo(
+                "Recording saved",
+                f"Profile \"{name}\" saved.\n{n} actions recorded.")
 
     def _tick(self) -> None:
         if not self._recording:
@@ -1616,6 +2204,7 @@ class App(tk.Tk):
         self._playing = True
         self._btn_play.config(text="⏹  Stop")
         self._btn_rec.config(state="disabled")
+        self._btn_cont.config(state="disabled")
         self._chk_loop.config(state="disabled")
         self._set_act_state("disabled")
         self._lbl_play_stat.config(text="▶ Playing", foreground="#0066cc")
@@ -1638,18 +2227,10 @@ class App(tk.Tk):
         self._play_progress.config(value=cmd_idx)
         loop_txt = f"  Loop #{loop_num}" if self._play_loop_var.get() else ""
         self._lbl_play_info.config(text=f"{cmd_idx + 1} / {total}{loop_txt}")
-        # highlight matching original action row in treeview
-        for iid in self._tree.get_children():
-            tags = list(self._tree.item(iid, "tags"))
-            if "playing" in tags:
-                tags.remove("playing")
-                self._tree.item(iid, tags=tags)
+        # highlight matching original action card
         if cmd_idx < len(self._play_orig_indices):
             orig = self._play_orig_indices[cmd_idx]
-            iid  = str(orig)
-            if iid in self._tree.get_children():
-                self._tree.item(iid, tags=["playing"])
-                self._tree.see(iid)
+            self._card_list.set_playing(orig)
 
     def _playback_done_cb(self) -> None:
         """Called from player thread when playback finishes."""
@@ -1660,17 +2241,14 @@ class App(tk.Tk):
         self._stop_f9_listener()
         self._btn_play.config(text="▶  Play", state="normal")
         self._btn_rec.config(state="normal")
+        if self._cur_profile:
+            self._btn_cont.config(state="normal")
         self._chk_loop.config(state="normal")
         self._set_act_state("normal")
         self._lbl_play_stat.config(text="Idle", foreground="")
         self._play_progress.config(value=0)
         self._lbl_play_info.config(text="")
-        # clear highlight
-        for iid in self._tree.get_children():
-            tags = list(self._tree.item(iid, "tags"))
-            if "playing" in tags:
-                tags.remove("playing")
-                self._tree.item(iid, tags=tags)
+        self._card_list.clear_playing()
         self.deiconify()
         self.lift()
         self._set_status("Playback finished.")
